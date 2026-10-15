@@ -1,0 +1,39 @@
+
+DROP TABLE IF EXISTS public.eicu_af_bcr_aps_candidate;
+
+CREATE TABLE public.eicu_af_bcr_aps_candidate AS
+
+WITH aps_ranked AS (
+    SELECT
+        patientunitstayid,
+        apacheversion,
+        acutephysiologyscore,
+
+        ROW_NUMBER() OVER (
+            PARTITION BY patientunitstayid
+            ORDER BY
+                CASE
+                    WHEN apacheversion = 'IVa' THEN 1
+                    WHEN apacheversion = 'IV' THEN 2
+                    ELSE 3
+                END
+        ) AS rn
+
+    FROM public.apachepatientresult
+
+    WHERE acutephysiologyscore >= 0
+)
+
+SELECT
+    c.stay_id,
+
+    a.acutephysiologyscore
+        AS aps_candidate,
+
+    a.apacheversion
+
+FROM public.eicu_af_bcr_cohort c
+
+LEFT JOIN aps_ranked a
+    ON c.stay_id = a.patientunitstayid
+   AND a.rn = 1;

@@ -1,0 +1,126 @@
+SET datestyle = 'ISO, DMY';
+
+CREATE OR REPLACE TEMP VIEW af_bcr_egfr_2021 AS
+WITH source AS (
+    SELECT
+        c.subject_id::bigint AS subject_id,
+        c.hadm_id::bigint AS hadm_id,
+        c.stay_id::bigint AS stay_id,
+        c.age::double precision AS age_in_cohort,
+        UPPER(TRIM(c.gender::text)) AS sex,
+        c.creatinine::double precision AS creatinine_original,
+        c.creatinine_unit::text AS creatinine_unit,
+        c.creatinine_time::timestamp AS creatinine_time,
+        c.icu_intime::timestamp AS icu_intime,
+        c.prediction_time::timestamp AS prediction_time,
+        c.bcr::double precision AS bcr,
+        p.anchor_age,
+        p.anchor_year,
+        a.admittime AS index_hospital_admittime,
+        -- Official admission-age approximation; top-coded ages remain approximate.
+        (p.anchor_age + EXTRACT(YEAR FROM a.admittime)::integer - p.anchor_year)::double precision
+            AS age_at_admission_estimated,
+        (p.anchor_age = 91) AS age_topcoded,
+        LOWER(REPLACE(TRIM(c.creatinine_unit::text), ' ', '')) AS unit_normalized
+    FROM af_bcr_cohort c
+    LEFT JOIN mimiciv_hosp.patients p ON p.subject_id = c.subject_id::bigint
+    LEFT JOIN mimiciv_hosp.admissions a
+        ON a.hadm_id = c.hadm_id::bigint AND a.subject_id = c.subject_id::bigint
+), normalized AS (
+    SELECT s.*,
+        CASE
+            WHEN unit_normalized IN ('mg/dl', 'mg/dl.') THEN creatinine_original
+            WHEN unit_normalized IN ('umol/l', 'µmol/l', 'μmol/l') THEN creatinine_original / 88.4
+            ELSE NULL
+        END AS scr_mg_dl,
+        CASE WHEN sex = 'F' THEN 0.7 WHEN sex = 'M' THEN 0.9 END AS kappa,
+        CASE WHEN sex = 'F' THEN -0.241 WHEN sex = 'M' THEN -0.302 END AS alpha,
+        CASE WHEN sex = 'F' THEN 1.012 WHEN sex = 'M' THEN 1.0 END AS female_multiplier,
+        CASE
+            WHEN creatinine_time IS NULL OR icu_intime IS NULL OR prediction_time IS NULL
+                THEN 'TIME_MISSING_REVIEW'
+            WHEN creatinine_time < icu_intime OR creatinine_time > prediction_time
+                THEN 'OUTSIDE_ICU_TO_PREDICTION_WINDOW_REVIEW'
+            ELSE 'WITHIN_ICU_TO_PREDICTION_WINDOW'
+        END AS timing_qc
+    FROM source s
+), calculated AS (
+    SELECT n.*,
+        CASE
+            WHEN scr_mg_dl > 0 AND scr_mg_dl < 'Infinity'::double precision
+                AND sex IN ('F','M') AND age_at_admission_estimated >= 18
+                AND age_at_admission_estimated < 'Infinity'::double precision
+            THEN 142.0
+                * POWER(LEAST(scr_mg_dl / kappa, 1.0), alpha)
+                * POWER(GREATEST(scr_mg_dl / kappa, 1.0), -1.200)
+                * POWER(0.9938, age_at_admission_estimated)
+                * female_multiplier
+            ELSE NULL
+        END AS egfr_ckdepi2021,
+        -- Comparison estimate to audit whether the previous cohort age changes classification.
+        CASE
+            WHEN scr_mg_dl > 0 AND scr_mg_dl < 'Infinity'::double precision
+                AND sex IN ('F','M') AND age_in_cohort >= 18
+                AND age_in_cohort < 'Infinity'::double precision
+            THEN 142.0
+                * POWER(LEAST(scr_mg_dl / kappa, 1.0), alpha)
+                * POWER(GREATEST(scr_mg_dl / kappa, 1.0), -1.200)
+                * POWER(0.9938, age_in_cohort)
+                * female_multiplier
+            ELSE NULL
+        END AS egfr_using_cohort_age
+    FROM normalized n
+)
+SELECT
+    subject_id, hadm_id, stay_id, sex, age_in_cohort, age_at_admission_estimated,
+    anchor_age, anchor_year, age_topcoded,
+    CASE
+        WHEN age_at_admission_estimated IS NULL THEN 'DATABASE_AGE_UNAVAILABLE'
+        WHEN age_in_cohort IS NULL THEN 'COHORT_AGE_UNAVAILABLE'
+        WHEN age_in_cohort <> age_at_admission_estimated THEN 'AGE_MISMATCH_REVIEW'
+        ELSE 'AGE_MATCH'
+    END AS age_qc,
+    index_hospital_admittime, icu_intime, prediction_time,
+    creatinine_original, creatinine_unit, scr_mg_dl, creatinine_time, timing_qc, bcr,
+    egfr_ckdepi2021, egfr_using_cohort_age,
+    CASE WHEN egfr_ckdepi2021 IS NULL THEN NULL
+         WHEN egfr_ckdepi2021 < 60.0 THEN '<60' ELSE '>=60' END AS egfr_group,
+    CASE WHEN egfr_using_cohort_age IS NULL THEN NULL
+         WHEN egfr_using_cohort_age < 60.0 THEN '<60' ELSE '>=60' END AS egfr_group_using_cohort_age,
+    CASE
+        WHEN scr_mg_dl IS NULL THEN 'CREATININE_OR_UNIT_MISSING_UNSUPPORTED'
+        WHEN NOT (scr_mg_dl > 0 AND scr_mg_dl < 'Infinity'::double precision)
+            THEN 'INVALID_CREATININE_REVIEW'
+        WHEN sex IS NULL OR sex NOT IN ('F','M') THEN 'SEX_INVALID_OR_MISSING'
+        WHEN age_at_admission_estimated IS NULL OR age_at_admission_estimated < 18
+            THEN 'AGE_INVALID_OR_MISSING'
+        ELSE 'CALCULABLE_NOT_A_CLINICAL_VALIDITY_CHECK'
+    END AS calculation_qc
+FROM calculated;
+
+-- Quality checks: the number of records must match the original cohort.
+SELECT COUNT(*) AS output_rows, COUNT(DISTINCT stay_id) AS unique_stays,
+       COUNT(DISTINCT subject_id) AS unique_patients,
+       COUNT(*) FILTER (WHERE egfr_ckdepi2021 IS NULL) AS egfr_missing,
+       COUNT(*) FILTER (WHERE age_qc = 'AGE_MISMATCH_REVIEW') AS age_mismatch,
+       COUNT(*) FILTER (WHERE age_topcoded) AS age_topcoded_n,
+       COUNT(*) FILTER (WHERE timing_qc <> 'WITHIN_ICU_TO_PREDICTION_WINDOW') AS timing_review_n,
+       COUNT(*) FILTER (WHERE egfr_group IS DISTINCT FROM egfr_group_using_cohort_age)
+           AS classification_difference_by_age_definition
+FROM af_bcr_egfr_2021;
+
+SELECT age_qc, timing_qc, calculation_qc, COUNT(*) AS n
+FROM af_bcr_egfr_2021
+GROUP BY age_qc, timing_qc, calculation_qc
+ORDER BY n DESC;
+
+SELECT egfr_group, COUNT(*) AS n,
+       PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY egfr_ckdepi2021) AS median_egfr
+FROM af_bcr_egfr_2021
+GROUP BY egfr_group ORDER BY egfr_group;
+
+-- Export this FINAL result. Merge by identifiers, never by assumed row order.
+-- Retains all cohort records; flagged rows must be reviewed before subgroup analysis.
+-- RRT is not excluded here: join the VERIFIED first-24h RRT flag separately,
+-- then define the renal-function subgroup population explicitly.
+SELECT * FROM af_bcr_egfr_2021 ORDER BY subject_id, hadm_id, stay_id;

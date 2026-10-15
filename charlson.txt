@@ -1,0 +1,186 @@
+
+DROP TABLE IF EXISTS public.eicu_af_bcr_charlson;
+
+CREATE TABLE public.eicu_af_bcr_charlson AS
+
+WITH history_flags AS (
+    SELECT
+        c.stay_id,
+        c.age,
+        LOWER(COALESCE(h.pasthistorypath, '')) AS path,
+
+        h.pasthistoryoffset
+
+    FROM public.eicu_af_bcr_cohort c
+
+    LEFT JOIN public.pasthistory h
+      ON h.patientunitstayid = c.stay_id
+     AND h.pasthistoryoffset < 1440
+),
+
+disease_flags AS (
+    SELECT
+        stay_id,
+        MAX(age) AS age,
+
+        MAX(CASE WHEN
+            path LIKE '%myocardial infarction/%'
+            THEN 1 ELSE 0 END) AS mi,
+
+        MAX(CASE WHEN
+            path LIKE '%congestive heart failure/%'
+            THEN 1 ELSE 0 END) AS chf,
+
+        MAX(CASE WHEN
+            path LIKE '%peripheral vascular disease/%'
+            THEN 1 ELSE 0 END) AS pvd,
+
+        MAX(CASE WHEN
+            path LIKE '%/strokes/%'
+            OR path LIKE '%/tia(s)/%'
+            THEN 1 ELSE 0 END) AS cerebrovascular,
+
+        MAX(CASE WHEN
+            path LIKE '%dementia/%'
+            THEN 1 ELSE 0 END) AS dementia,
+
+        MAX(CASE WHEN
+            path LIKE '%/copd/%'
+            THEN 1 ELSE 0 END) AS pulmonary,
+
+        MAX(CASE WHEN
+            path LIKE '%rheumatoid arthritis/%'
+            OR path LIKE '%/sle/%'
+            OR path LIKE '%scleroderma/%'
+            OR path LIKE '%vasculitis/%'
+            OR path LIKE '%polymyositis/%'
+            THEN 1 ELSE 0 END) AS rheumatic,
+
+        MAX(CASE WHEN
+            path LIKE '%peptic ulcer disease/%'
+            AND path NOT LIKE '%/no'
+            THEN 1 ELSE 0 END) AS peptic_ulcer,
+
+        MAX(CASE WHEN
+            path LIKE '%/cirrhosis/clinical diagnosis'
+            OR path LIKE '%/cirrhosis/biopsy proven'
+            THEN 1 ELSE 0 END) AS mild_liver,
+
+        MAX(CASE WHEN
+            path LIKE '%/cirrhosis/varices'
+            OR path LIKE '%/cirrhosis/ascites'
+            OR path LIKE '%/cirrhosis/coma'
+            OR path LIKE '%/cirrhosis/encephalopathy'
+            OR path LIKE '%/cirrhosis/ugi bleeding'
+            THEN 1 ELSE 0 END) AS severe_liver,
+
+        MAX(CASE WHEN
+            path LIKE '%/renal failure/%'
+            OR path LIKE '%/renal insufficiency/%'
+            THEN 1 ELSE 0 END) AS renal_disease,
+
+        MAX(CASE WHEN
+            path LIKE '%insulin dependent diabetes/%'
+            OR path LIKE '%non-insulin dependent diabetes/%'
+            THEN 1 ELSE 0 END) AS diabetes,
+
+        MAX(CASE WHEN
+            path LIKE '%diabetic retinopathy%'
+            OR path LIKE '%diabetic neuropathy%'
+            OR path LIKE '%diabetic nephropathy%'
+            THEN 1 ELSE 0 END) AS diabetes_complication,
+
+        MAX(CASE WHEN
+            path LIKE '%hemiplegia%'
+            OR path LIKE '%paraplegia%'
+            THEN 1 ELSE 0 END) AS paralysis,
+
+        MAX(CASE WHEN
+            path LIKE '%hematologic malignancy/aml'
+            OR path LIKE '%hematologic malignancy/all'
+            OR path LIKE '%hematologic malignancy/cll'
+            OR path LIKE '%hematologic malignancy/cml'
+            OR path LIKE '%hematologic malignancy/leukemia%'
+            THEN 1 ELSE 0 END) AS leukemia,
+
+        MAX(CASE WHEN
+            path LIKE '%non-hodgkins lymphoma%'
+            OR path LIKE '%hodgkins disease%'
+            THEN 1 ELSE 0 END) AS lymphoma,
+
+        MAX(CASE WHEN
+            path LIKE '%/cancer-primary site/%'
+            AND path NOT LIKE '%/none'
+            OR path LIKE '%/chemotherapy/%'
+            OR path LIKE '%/radiation therapy within past 6 months/%'
+            THEN 1 ELSE 0 END) AS cancer,
+
+        MAX(CASE WHEN
+            path LIKE '%/metastases/%'
+            THEN 1 ELSE 0 END) AS metastasis,
+
+        MAX(CASE WHEN
+            path LIKE '%/aids/aids'
+            THEN 1 ELSE 0 END) AS aids
+
+    FROM history_flags
+    GROUP BY stay_id
+),
+
+scored AS (
+    SELECT
+        *,
+
+        mi + chf + pvd + cerebrovascular
+        + dementia + pulmonary + rheumatic
+        + peptic_ulcer
+
+        + CASE
+            WHEN severe_liver = 1 THEN 3
+            WHEN mild_liver = 1 THEN 1
+            ELSE 0
+          END
+
+        + renal_disease * 2
+
+        + CASE
+            WHEN diabetes_complication = 1 THEN 2
+            WHEN diabetes = 1 THEN 1
+            ELSE 0
+          END
+
+        + paralysis * 2
+
+        + CASE
+            WHEN metastasis = 1 THEN 6
+            WHEN cancer = 1 OR leukemia = 1
+                 OR lymphoma = 1 THEN 2
+            ELSE 0
+          END
+
+        + aids * 6
+
+        AS charlson_score
+
+    FROM disease_flags
+)
+
+SELECT
+    c.stay_id,
+
+    s.charlson_score,
+
+    s.charlson_score +
+        CASE
+            WHEN c.age >= 90 THEN 5
+            WHEN c.age >= 80 THEN 4
+            WHEN c.age >= 70 THEN 3
+            WHEN c.age >= 60 THEN 2
+            WHEN c.age >= 50 THEN 1
+            ELSE 0
+        END AS age_adjusted_charlson
+
+FROM public.eicu_af_bcr_cohort c
+
+LEFT JOIN scored s
+    ON c.stay_id = s.stay_id;
